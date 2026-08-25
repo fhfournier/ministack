@@ -1612,10 +1612,14 @@ async def _handle_special_data_plane_request(
     request_id: str,
 ):
     """Handle special-case service entrypoints before the generic router."""
-    # Iceberg REST catalog — route /iceberg/* to s3tables service
+    # Iceberg REST catalog — route /iceberg/* to s3tables service.
+    # Must not fall through to S3 (which reads "iceberg" as a bucket name).
     if path.startswith("/iceberg"):
         try:
-            return await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+            result = await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+            if result is not None:
+                return result
+            return 200, {"Content-Type": "application/json"}, b"{}"
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()

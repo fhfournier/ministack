@@ -331,14 +331,30 @@ def _create_table(bucket_arn, namespace, data):
     schema_fields = []
     metadata = data.get("metadata", {})
     iceberg_meta = metadata.get("iceberg", {})
-    schema_def = iceberg_meta.get("schema", {})
+    schema_def = iceberg_meta.get("schema", iceberg_meta.get("schemaV2", {}))
     for f in schema_def.get("field", schema_def.get("fields", [])):
         schema_fields.append({"name": f["name"], "type": f.get("type", "string"),
                                "required": f.get("required", False)})
+    logger.info("S3Tables: create_table %s/%s schema_fields=%d metadata_keys=%s", namespace, table_name, len(schema_fields), list(metadata.keys()) if metadata else "none")
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = f"s3://{bucket_name}/{namespace}/{table_name}"
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
+    # Preserve field names from the input but ensure the schema has the
+    # Iceberg-required structure: {"type": "struct", "schema-id": 0, "fields": [
+    #   {"id": 1, "name": "...", "type": "string", "required": false}, ...]}
+    raw_schema = iceberg_meta.get("schema", iceberg_meta.get("schemaV2"))
+    if raw_schema and raw_schema.get("fields"):
+        fields = []
+        for i, f in enumerate(raw_schema["fields"]):
+            fields.append({
+                "id": f.get("id", i + 1),
+                "name": f["name"],
+                "type": _to_iceberg_type(f.get("type", "string")) if isinstance(f.get("type"), str) else "string",
+                "required": f.get("required", False),
+            })
+        iceberg_metadata["schemas"] = [{"type": "struct", "schema-id": 0, "fields": fields}]
+        iceberg_metadata["last-column-id"] = len(fields)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
 
@@ -434,14 +450,27 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
 
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
-def _iceberg_config():
-    return json_response({"defaults": {
+def _iceberg_config(query_params=None):
+    warehouse = ""
+    if query_params:
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+    # S3 connection properties go in ``defaults`` so a client that already
+    # supplies them (e.g. a Spark job with its own s3.endpoint pointing at
+    # host.docker.internal) is not overridden. Iceberg REST spec: ``defaults``
+    # are used only when the client has no value; ``overrides`` always win.
+    defaults = {
         "client.region": get_region(),
         "s3.endpoint": _gateway_url(),
         "s3.access-key-id": "test",
         "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
-    }, "overrides": {}})
+    }
+    overrides = {}
+    if warehouse:
+        overrides["prefix"] = warehouse
+    return json_response({"defaults": defaults, "overrides": overrides})
 
 
 def _iceberg_error(message, exc_type, code):
@@ -474,39 +503,55 @@ def _iceberg_get_namespace(namespace, allow_cross_region):
     return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
-def _iceberg_list_tables(namespace, allow_cross_region):
+def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
     result = []
-    for table in _iceberg_values(_tables, lambda table: _namespace_name(table) == namespace, allow_cross_region):
+    for table in _iceberg_values(_tables, _pred, allow_cross_region):
         result.append({"namespace": [namespace], "name": table["name"]})
     return json_response({"identifiers": result})
 
 
-def _iceberg_load_table(namespace, table_name, allow_cross_region):
-    matches = _iceberg_values(
-        _tables,
-        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
-        allow_cross_region,
-    )
+def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace or table["name"] != table_name:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
+    matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
+        # The ``config`` block in a LoadTable response is applied by the
+        # Iceberg client to S3FileIO for data file reads/writes. Returning
+        # ``s3.endpoint=http://localhost:4566`` breaks containers that reach
+        # MiniStack via ``host.docker.internal``. Omit the endpoint here and
+        # let the client's own Spark conf (which knows its network topology)
+        # take effect. Credentials and path-style are safe defaults.
         return json_response({
             "metadata-location": table.get("metadataLocation", ""),
             "metadata": table.get("_iceberg_metadata", {}),
             "config": {
                 "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                "s3.endpoint": _gateway_url(), "s3.path-style-access": "true",
+                "s3.path-style-access": "true",
                 "s3.region": get_region(), "client.region": get_region(),
             },
         })
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
-def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
-    matches = _iceberg_values(
-        _tables,
-        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
-        allow_cross_region,
-    )
+def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace or table["name"] != table_name:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
+    matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
         metadata = table.get("_iceberg_metadata", {})
@@ -636,7 +681,7 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         return None
 
     if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
-        return _iceberg_config()
+        return _iceberg_config(query_params)
 
     # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit
     if parts[1] == "v1" and parts[2] == "transactions" and method == "POST":
@@ -657,12 +702,27 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     # Support two URL formats:
     #   Standard Iceberg REST: /iceberg/v1/{prefix}/namespaces/...
     #   S3 Tables (no prefix): /iceberg/v1/namespaces/...  (warehouse in query param)
-    if parts[2] == "namespaces":
-        ns_idx = 2
-    elif len(parts) >= 4 and parts[3] == "namespaces":
-        ns_idx = 3
-    else:
+    #
+    # The prefix carries the warehouse value from /v1/config, which for S3
+    # Tables is ``{account}:s3tablescatalog/{bucket-name}``. Extract the
+    # bucket name to scope table lookups -- without it, tables with the same
+    # name in different buckets collide and the wrong schema is returned.
+    # The prefix from /v1/config can contain ``/`` (e.g.
+    # ``000000000000:s3tablescatalog/bucket-name``), which splits into
+    # multiple URL segments. Scan for ``namespaces`` and treat everything
+    # between ``v1`` and ``namespaces`` as the prefix.
+    bucket_filter = None
+    ns_idx = None
+    for i in range(2, len(parts)):
+        if parts[i] == "namespaces":
+            ns_idx = i
+            break
+    if ns_idx is None:
         return None
+    if ns_idx > 2:
+        prefix = unquote("/".join(parts[2:ns_idx]))
+        if ":s3tablescatalog/" in prefix:
+            bucket_filter = prefix.split(":s3tablescatalog/", 1)[1]
 
     rest = parts[ns_idx + 1:]  # segments after "namespaces"
 
@@ -675,17 +735,17 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         table_rest = rest[2:]
         if len(table_rest) == 0:
             if method == "GET":
-                return _iceberg_list_tables(namespace, allow_cross_region)
+                return _iceberg_list_tables(namespace, allow_cross_region, bucket_filter)
             if method == "POST":
                 data = json.loads(body) if body else {}
                 return _iceberg_create_table(namespace, data, allow_cross_region)
         if len(table_rest) == 1:
             table_name = table_rest[0]
             if method == "GET":
-                return _iceberg_load_table(namespace, table_name, allow_cross_region)
+                return _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter)
             if method == "POST":
                 data = json.loads(body) if body else {}
-                return _iceberg_commit_table(namespace, table_name, data, allow_cross_region)
+                return _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter)
             if method == "HEAD":
                 if _iceberg_values(
                     _tables,

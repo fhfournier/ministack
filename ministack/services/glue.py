@@ -53,6 +53,7 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # Glue Docker image — maps GlueVersion to the amazon/aws-glue-libs tag.
 # Users can override via GLUE_DOCKER_IMAGE env var.
 _GLUE_VERSION_IMAGES = {
+    "5.0": "amazon/aws-glue-libs:5",
     "4.0": "amazon/aws-glue-libs:glue_libs_4.0.0_image_01",
     "3.0": "amazon/aws-glue-libs:glue_libs_3.0.0_image_01",
 }
@@ -274,7 +275,7 @@ def _handle_request_sync(method, path, headers, body, query_params):
     # dispatch already lands `glue`-signed requests here, so a plain
     # path check is all that's needed to tell the two protocols apart.
     if path.startswith("/iceberg"):
-        return _handle_iceberg_rest(method, path, query_params)
+        return _handle_iceberg_rest(method, path, query_params, body=body)
 
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
@@ -523,17 +524,298 @@ def _iceberg_maybe_log_tls_hint():
         )
 
 
-def _handle_iceberg_rest(method, path, query_params):
+def _iceberg_write_metadata(metadata: dict) -> str:
+    """Write an Iceberg metadata.json to S3 and return its s3:// URI.
+
+    The location is derived from the table's own ``location`` field (which
+    Spark sets to an s3:// path) with ``/metadata/NNNNN-uuid.metadata.json``
+    appended, matching the naming convention real Iceberg writers use.
+    """
+    import uuid as _uuid
+    from ministack.services import s3 as _s3
+
+    table_location = metadata.get("location", "")
+    if not table_location.startswith("s3://"):
+        table_location = f"s3://iceberg-warehouse/{_uuid.uuid4().hex}"
+
+    rest = table_location[len("s3://"):]
+    bucket = rest.split("/", 1)[0]
+    base_key = rest.split("/", 1)[1] if "/" in rest else ""
+
+    # Ensure the bucket exists
+    if _s3._ensure_bucket(bucket) is None:
+        _s3._create_bucket(bucket, b"", {})
+
+    snap_id = len(metadata.get("snapshots", []))
+    filename = f"{snap_id:05d}-{_uuid.uuid4().hex[:8]}.metadata.json"
+    key = f"{base_key}/metadata/{filename}".lstrip("/")
+
+    body = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    _s3._put_object(bucket, key, body, {"content-type": "application/json"})
+
+    return f"s3://{bucket}/{key}"
+
+
+def _iceberg_create_table(ns, body):
+    """POST /namespaces/{ns}/tables -- create an Iceberg table."""
+    if ns not in _databases:
+        return _iceberg_error(f"Namespace does not exist: {ns}",
+                              "NoSuchNamespaceException", 404)
+
+    name = body.get("name", "")
+    if not name:
+        return _iceberg_error("Table name is required",
+                              "BadRequestException", 400)
+
+    key = f"{ns}/{name}"
+    if key in _tables and (
+            _tables[key].get("Parameters") or {}).get("metadata_location"):
+        return _iceberg_error(f"Table already exists: {ns}.{name}",
+                              "AlreadyExistsException", 409)
+
+    # Build initial metadata from the request
+    schema = body.get("schema", {})
+    partition_spec = body.get("partition-spec", body.get("partition_spec", {}))
+    location = body.get("location", "")
+    properties = body.get("properties", {})
+
+    metadata = {
+        "format-version": body.get("format-version", 2),
+        "table-uuid": new_uuid(),
+        "location": location or f"s3://iceberg-warehouse/{ns}/{name}",
+        "last-sequence-number": 0,
+        "last-updated-ms": int(time.time() * 1000),
+        "last-column-id": max((f.get("id", 0) for f in schema.get("fields", [])),
+                              default=0),
+        "current-schema-id": schema.get("schema-id", 0),
+        "schemas": [schema] if schema else [],
+        "default-spec-id": 0,
+        "partition-specs": [partition_spec] if partition_spec else [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 999,
+        "default-sort-order-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": properties,
+        "current-snapshot-id": -1,
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": [],
+    }
+
+    metadata_location = _iceberg_write_metadata(metadata)
+
+    # Register in the Glue catalog
+    _tables[key] = {
+        "Name": name,
+        "DatabaseName": ns,
+        "Description": "",
+        "Owner": "",
+        "CreateTime": int(time.time()),
+        "UpdateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
+        "StorageDescriptor": {},
+        "PartitionKeys": [],
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "metadata_location": metadata_location,
+            "table_type": "ICEBERG",
+        },
+        "IsRegisteredWithLakeFormation": False,
+        "CatalogId": get_account_id(),
+        "VersionId": "1",
+    }
+
+    return _iceberg_json({
+        "metadata-location": metadata_location,
+        "metadata": metadata,
+        "config": _iceberg_s3_overrides(),
+    })
+
+
+def _iceberg_commit_table(ns, table_name, body):
+    """POST /namespaces/{ns}/tables/{tbl} -- commit updates (new snapshot)."""
+    table = _iceberg_table_entry(ns, table_name)
+    if table is None:
+        return _iceberg_error(f"Table does not exist: {ns}.{table_name}",
+                              "NoSuchTableException", 404)
+
+    metadata_location = table["Parameters"]["metadata_location"]
+    metadata = _iceberg_fetch_metadata(metadata_location)
+    if metadata is None:
+        return _iceberg_error(f"Cannot read current metadata for {ns}.{table_name}",
+                              "CommitFailedException", 500)
+
+    # Apply updates from the request
+    requirements = body.get("requirements", [])
+    updates = body.get("updates", [])
+
+    for update in updates:
+        action = update.get("action", "")
+        if action == "add-schema":
+            schema = update.get("schema", {})
+            schemas = metadata.setdefault("schemas", [])
+            schema_id = max((s.get("schema-id", 0) for s in schemas), default=-1) + 1
+            schema["schema-id"] = schema_id
+            schemas.append(schema)
+        elif action == "set-current-schema":
+            metadata["current-schema-id"] = update.get("schema-id", 0)
+        elif action == "add-partition-spec":
+            spec = update.get("spec", {})
+            specs = metadata.setdefault("partition-specs", [])
+            spec_id = max((s.get("spec-id", 0) for s in specs), default=-1) + 1
+            spec["spec-id"] = spec_id
+            specs.append(spec)
+        elif action == "set-default-spec":
+            metadata["default-spec-id"] = update.get("spec-id", 0)
+        elif action == "add-sort-order":
+            order = update.get("sort-order", {})
+            orders = metadata.setdefault("sort-orders", [])
+            order_id = max((o.get("order-id", 0) for o in orders), default=-1) + 1
+            order["order-id"] = order_id
+            orders.append(order)
+        elif action == "set-default-sort-order":
+            metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
+        elif action == "add-snapshot":
+            snapshot = update.get("snapshot", {})
+            metadata.setdefault("snapshots", []).append(snapshot)
+            metadata["current-snapshot-id"] = snapshot.get("snapshot-id",
+                                                           metadata.get("current-snapshot-id", -1))
+            metadata.setdefault("snapshot-log", []).append({
+                "timestamp-ms": snapshot.get("timestamp-ms", int(time.time() * 1000)),
+                "snapshot-id": snapshot.get("snapshot-id"),
+            })
+            seq = metadata.get("last-sequence-number", 0) + 1
+            metadata["last-sequence-number"] = seq
+        elif action == "set-snapshot-ref":
+            ref_name = update.get("ref-name", "main")
+            refs = metadata.setdefault("refs", {})
+            refs[ref_name] = {
+                "snapshot-id": update.get("snapshot-id"),
+                "type": update.get("type", "branch"),
+            }
+            if ref_name == "main" and update.get("snapshot-id") is not None:
+                metadata["current-snapshot-id"] = update["snapshot-id"]
+        elif action == "set-properties":
+            metadata.setdefault("properties", {}).update(
+                update.get("updates", {}))
+        elif action == "remove-properties":
+            props = metadata.get("properties", {})
+            for key in update.get("removals", []):
+                props.pop(key, None)
+        elif action == "set-location":
+            metadata["location"] = update.get("location", metadata.get("location", ""))
+        else:
+            logger.debug("Iceberg: ignoring unknown commit action %s", action)
+
+    metadata["last-updated-ms"] = int(time.time() * 1000)
+
+    # Write the new metadata and update the catalog pointer
+    old_location = metadata_location
+    new_location = _iceberg_write_metadata(metadata)
+    table["Parameters"]["metadata_location"] = new_location
+    table["UpdateTime"] = int(time.time())
+    version = int(table.get("VersionId", "1")) + 1
+    table["VersionId"] = str(version)
+
+    metadata.setdefault("metadata-log", []).append({
+        "timestamp-ms": metadata["last-updated-ms"],
+        "metadata-file": old_location,
+    })
+
+    return _iceberg_json({
+        "metadata-location": new_location,
+        "metadata": metadata,
+        "config": _iceberg_s3_overrides(),
+    })
+
+
+def _iceberg_drop_table(ns, table_name):
+    """DELETE /namespaces/{ns}/tables/{tbl} -- drop table."""
+    key = f"{ns}/{table_name}"
+    if key not in _tables:
+        return _iceberg_error(f"Table does not exist: {ns}.{table_name}",
+                              "NoSuchTableException", 404)
+    _tables.pop(key, None)
+    _partitions.pop(key, None)
+    return _iceberg_json({})
+
+
+def _iceberg_create_namespace(body):
+    """POST /namespaces -- create namespace."""
+    namespace = body.get("namespace", [])
+    if isinstance(namespace, list):
+        name = namespace[0] if namespace else ""
+    else:
+        name = str(namespace)
+    if not name:
+        return _iceberg_error("Namespace name is required",
+                              "BadRequestException", 400)
+    if name in _databases:
+        return _iceberg_error(f"Namespace already exists: {name}",
+                              "AlreadyExistsException", 409)
+    properties = body.get("properties", {})
+    _databases[name] = {
+        "Name": name,
+        "Description": properties.get("comment", ""),
+        "LocationUri": properties.get("location"),
+        "Parameters": properties,
+        "CreateTime": int(time.time()),
+        "CatalogId": get_account_id(),
+    }
+    return _iceberg_json({"namespace": [name], "properties": properties})
+
+
+def _iceberg_update_namespace_properties(ns, body):
+    """POST /namespaces/{ns}/properties -- update namespace properties."""
+    if ns not in _databases:
+        return _iceberg_error(f"Namespace does not exist: {ns}",
+                              "NoSuchNamespaceException", 404)
+    removals = body.get("removals", [])
+    updates = body.get("updates", {})
+    params = _databases[ns].setdefault("Parameters", {})
+    removed = []
+    for key in removals:
+        if key in params:
+            del params[key]
+            removed.append(key)
+    missing = [key for key in removals if key not in removed]
+    params.update(updates)
+    return _iceberg_json({
+        "updated": list(updates.keys()),
+        "removed": removed,
+        "missing": missing,
+    })
+
+
+def _iceberg_delete_namespace(ns):
+    """DELETE /namespaces/{ns} -- delete namespace."""
+    if ns not in _databases:
+        return _iceberg_error(f"Namespace does not exist: {ns}",
+                              "NoSuchNamespaceException", 404)
+    prefix = f"{ns}/"
+    if any(k.startswith(prefix) for k in _tables):
+        return _iceberg_error(f"Namespace {ns} is not empty",
+                              "NamespaceNotEmptyException", 409)
+    del _databases[ns]
+    return _iceberg_json({})
+
+
+def _handle_iceberg_rest(method, path, query_params, body=None):
     _iceberg_maybe_log_tls_hint()
     parts = [unquote(p) for p in path.strip("/").split("/") if p]
-    # parts: ["iceberg", "v1", ...]
     if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
         return _iceberg_error(f"Unknown Iceberg REST path: {path}",
                               "NotFoundException", 404)
 
-    # GET /iceberg/v1/config?warehouse=<id> — called once on ATTACH. The
-    # prefix tells the client to build subsequent URLs as
-    # /v1/catalogs/{warehouse}/... — Glue's prefix shape.
+    # Parse JSON body for write operations
+    if body is None:
+        body = {}
+    elif isinstance(body, bytes):
+        try:
+            body = json.loads(body) if body else {}
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+
+    # GET /iceberg/v1/config
     if parts[2] == "config" and len(parts) == 3 and method == "GET":
         warehouse = query_params.get("warehouse", "")
         if isinstance(warehouse, list):
@@ -542,44 +824,67 @@ def _handle_iceberg_rest(method, path, query_params):
         return _iceberg_json({"defaults": defaults,
                               "overrides": _iceberg_s3_overrides()})
 
-    # Everything else: /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
-    # The catalog id is accepted but not validated — MiniStack is
-    # single-catalog per account, scoping happens via the SigV4 account id.
+    # /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
     if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
         return _iceberg_error(
             f"Operation not supported: {method} {path}",
             "UnsupportedOperationException", 501)
 
-    if len(parts) == 5 and method == "GET":  # ListNamespaces
-        return _iceberg_json(
-            {"namespaces": [[name] for name in sorted(_databases.keys())]})
+    # -- Namespace operations --
 
-    if len(parts) == 6 and method == "GET":  # GetNamespace
-        ns = parts[5]
-        if ns not in _databases:
-            return _iceberg_error(f"Namespace does not exist: {ns}",
-                                  "NoSuchNamespaceException", 404)
-        return _iceberg_json({"namespace": [ns], "properties": {}})
+    if len(parts) == 5:
+        if method == "GET":
+            return _iceberg_json(
+                {"namespaces": [[name] for name in sorted(_databases.keys())]})
+        if method == "POST":
+            return _iceberg_create_namespace(body)
 
-    if len(parts) >= 7 and parts[6] == "tables":
+    if len(parts) == 6:
         ns = parts[5]
-        if len(parts) == 7 and method == "GET":  # ListTables
+        if method == "GET":
             if ns not in _databases:
                 return _iceberg_error(f"Namespace does not exist: {ns}",
                                       "NoSuchNamespaceException", 404)
-            prefix = f"{ns}/"
-            names = sorted(
-                t["Name"] for k, t in _tables.items()
-                if k.startswith(prefix)
-                and (t.get("Parameters") or {}).get("metadata_location"))
-            return _iceberg_json(
-                {"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+            return _iceberg_json({"namespace": [ns],
+                                  "properties": _databases[ns].get("Parameters", {})})
+        if method == "HEAD":
+            return (200 if ns in _databases else 404), {}, b""
+        if method == "DELETE":
+            return _iceberg_delete_namespace(ns)
+
+    if len(parts) == 7 and parts[6] == "properties" and method == "POST":
+        return _iceberg_update_namespace_properties(parts[5], body)
+
+    # -- Table operations --
+
+    if len(parts) >= 7 and parts[6] == "tables":
+        ns = parts[5]
+        if len(parts) == 7:
+            if method == "GET":
+                if ns not in _databases:
+                    return _iceberg_error(f"Namespace does not exist: {ns}",
+                                          "NoSuchNamespaceException", 404)
+                prefix = f"{ns}/"
+                names = sorted(
+                    t["Name"] for k, t in _tables.items()
+                    if k.startswith(prefix)
+                    and (t.get("Parameters") or {}).get("metadata_location"))
+                return _iceberg_json(
+                    {"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+            if method == "POST":
+                return _iceberg_create_table(ns, body)
+
         if len(parts) == 8:
-            if method == "GET":  # LoadTable — the hot path
-                return _iceberg_load_table(ns, parts[7])
-            if method == "HEAD":  # TableExists
-                exists = _iceberg_table_entry(ns, parts[7]) is not None
+            tbl = parts[7]
+            if method == "GET":
+                return _iceberg_load_table(ns, tbl)
+            if method == "HEAD":
+                exists = _iceberg_table_entry(ns, tbl) is not None
                 return (200 if exists else 404), {}, b""
+            if method == "POST":
+                return _iceberg_commit_table(ns, tbl, body)
+            if method == "DELETE":
+                return _iceberg_drop_table(ns, tbl)
 
     return _iceberg_error(
         f"Operation not supported: {method} {path}",
@@ -1487,11 +1792,34 @@ runpy.run_path(_script, run_name="__main__")
 """
 
 
+def _extract_python_error(logs: str) -> str:
+    """Pull the Python traceback out of Spark's mixed output.
+
+    Spark routes everything through stdout, so a Python traceback is buried
+    under hundreds of Java INFO lines. Look for the last ``Traceback`` block
+    and return everything from there to the end of the error.
+    """
+    marker = "Traceback (most recent call last):"
+    idx = logs.rfind(marker)
+    if idx == -1:
+        return ""
+    return logs[idx:].strip()
+
+
 def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
     glue_version = job.get("GlueVersion", "4.0")
     image = _glue_image_for_version(glue_version)
     container_name = f"ministack-glue-{job_name}-{run['Id'][:8]}"
+
+    # Ensure the default Iceberg warehouse bucket exists so CREATE TABLE
+    # ... USING iceberg works without the user pre-creating it.
+    try:
+        from ministack.services import s3 as _s3
+        if _s3._ensure_bucket("ministack-glue-warehouse") is None:
+            _s3._create_bucket("ministack-glue-warehouse", b"", {})
+    except Exception:
+        pass
 
     # Remove stale container with same name
     try:
@@ -1532,33 +1860,54 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     # Extra py files (Glue --extra-py-files)
     extra_py = args.get("--extra-py-files", "")
 
-    # Build environment for the container
+    # Build environment for the container.
+    # Both Python (boto3) and Java (AWS SDK v2) credential chains read these.
+    # Hardcoded to "test" so the Glue container always authenticates against
+    # MiniStack regardless of what the host env carries.
     container_env = {
-        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        # Route the script's own SDK clients (boto3 et al) at MiniStack, the
-        # same injection Lambda containers, CodeBuild and ECS RunTask do.
-        # Only the S3A conf below covered Spark reads/writes; a bare
-        # boto3.client("s3") in the script escaped to real AWS and failed
-        # InvalidAccessKeyId (#1492).
         "AWS_ENDPOINT_URL": s3_endpoint,
         "DISABLE_SSL": "true",
     }
 
     # Build the spark-submit command.
-    # The aws-glue-libs image has /home/glue_user/spark/bin/spark-submit.
+    ak = container_env["AWS_ACCESS_KEY_ID"]
+    sk = container_env["AWS_SECRET_ACCESS_KEY"]
     cmd = [
         "spark-submit",
         "--master", "local[*]",
+        # S3A (Hadoop filesystem for s3a:// paths)
         "--conf", f"spark.hadoop.fs.s3a.endpoint={s3_endpoint}",
         "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
-        "--conf", f"spark.hadoop.fs.s3a.access.key={container_env['AWS_ACCESS_KEY_ID']}",
-        "--conf", f"spark.hadoop.fs.s3a.secret.key={container_env['AWS_SECRET_ACCESS_KEY']}",
+        "--conf", f"spark.hadoop.fs.s3a.access.key={ak}",
+        "--conf", f"spark.hadoop.fs.s3a.secret.key={sk}",
         "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
         "--conf", "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
     ]
+
+    # Iceberg GlueCatalog conf -- add when the user's job or --conf references
+    # iceberg, or when --datalake-formats includes it. Glue 5 has Iceberg on
+    # the classpath by default; Glue 4 only when --datalake-formats is set.
+    conf_arg = args.get("--conf", "")
+    datalake_formats = args.get("--datalake-formats", "")
+    uses_iceberg = ("iceberg" in conf_arg.lower()
+                    or "iceberg" in datalake_formats.lower()
+                    or glue_version.startswith("5"))
+    if uses_iceberg:
+        cmd.extend([
+            "--conf", "spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog",
+            "--conf", "spark.sql.catalog.spark_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog",
+            "--conf", f"spark.sql.catalog.spark_catalog.glue.endpoint={s3_endpoint}",
+            "--conf", f"spark.sql.catalog.spark_catalog.warehouse=s3a://ministack-glue-warehouse/",
+            "--conf", "spark.sql.catalog.spark_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
+            "--conf", f"spark.sql.catalog.spark_catalog.s3.endpoint={s3_endpoint}",
+            "--conf", "spark.sql.catalog.spark_catalog.s3.path-style-access=true",
+            "--conf", f"spark.sql.catalog.spark_catalog.s3.access-key-id={ak}",
+            "--conf", f"spark.sql.catalog.spark_catalog.s3.secret-access-key={sk}",
+        ])
 
     # Add extra-py-files if present
     if extra_py:
@@ -1581,6 +1930,22 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     # Append Glue job arguments (--key value pairs) after the script
     cmd.extend(spark_args)
 
+    # --additional-python-modules: pip install before spark-submit,
+    # matching real Glue which installs packages before the script runs.
+    # The Glue 5 image has entrypoint ["bash", "-l"], so we must override
+    # the entrypoint to avoid double-bash invocation.
+    extra_modules = args.get("--additional-python-modules", "")
+    _entrypoint_override = None
+    if extra_modules:
+        pkgs = [p.strip() for p in extra_modules.split(",") if p.strip()]
+        if pkgs:
+            pip_cmd = "pip install --quiet --no-warn-script-location " + " ".join(
+                f"'{p}'" for p in pkgs)
+            spark_cmd = " ".join(f"'{c}'" for c in cmd)
+            cmd = [f"{pip_cmd} && exec {spark_cmd}"]
+            _entrypoint_override = ["bash", "-lc"]
+            logger.info("Glue: will install additional modules for %s: %s", job_name, pkgs)
+
     container_kwargs = {
         "image": image,
         "name": container_name,
@@ -1589,6 +1954,8 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "detach": True,
         "labels": container_reaper.own_labels("glue", job_name=job_name),
     }
+    if _entrypoint_override:
+        container_kwargs["entrypoint"] = _entrypoint_override
 
     if ms_network:
         container_kwargs["network"] = ms_network
@@ -1629,18 +1996,24 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     try:
         result = container.wait(timeout=min(job.get("Timeout", 2880) * 60, 3600))
         exit_code = result.get("StatusCode", -1)
-        logs = container.logs(tail=200).decode("utf-8", errors="replace")
+        # Capture the full output. Spark routes Python tracebacks through
+        # stdout (not stderr), so tail=200 loses them under Java INFO lines.
+        all_logs = container.logs().decode("utf-8", errors="replace")
+        if all_logs:
+            logger.info("Glue: %s output:\n%s", job_name, all_logs[-16000:])
 
         if exit_code == 0:
             run["JobRunState"] = "SUCCEEDED"
             logger.info("Glue: Spark job %s completed successfully", job_name)
         else:
             run["JobRunState"] = "FAILED"
-            run["ErrorMessage"] = logs[-2000:] if logs else f"Exit code {exit_code}"
+            # Extract the Python traceback if present, otherwise full logs
+            error_output = _extract_python_error(all_logs) or all_logs or f"Exit code {exit_code}"
+            run["ErrorMessage"] = error_output[-8000:]
             logger.warning("Glue: Spark job %s failed (exit %d)", job_name, exit_code)
     except Exception as e:
         run["JobRunState"] = "FAILED"
-        run["ErrorMessage"] = f"Container execution error: {e}"[:2000]
+        run["ErrorMessage"] = f"Container execution error: {e}"[:4000]
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
         try:
