@@ -522,277 +522,6 @@ def _iceberg_maybe_log_tls_hint():
         )
 
 
-def _iceberg_write_metadata(metadata: dict) -> str:
-    """Write an Iceberg metadata.json to S3 and return its s3:// URI.
-
-    The location is derived from the table's own ``location`` field (which
-    Spark sets to an s3:// path) with ``/metadata/NNNNN-uuid.metadata.json``
-    appended, matching the naming convention real Iceberg writers use.
-    """
-    import uuid as _uuid
-
-    from ministack.services import s3 as _s3
-
-    table_location = metadata.get("location", "")
-    if not table_location.startswith("s3://"):
-        table_location = f"s3://iceberg-warehouse/{_uuid.uuid4().hex}"
-
-    rest = table_location[len("s3://") :]
-    bucket = rest.split("/", 1)[0]
-    base_key = rest.split("/", 1)[1] if "/" in rest else ""
-
-    # Ensure the bucket exists
-    if _s3._ensure_bucket(bucket) is None:
-        _s3._create_bucket(bucket, b"", {})
-
-    snap_id = len(metadata.get("snapshots", []))
-    filename = f"{snap_id:05d}-{_uuid.uuid4().hex[:8]}.metadata.json"
-    key = f"{base_key}/metadata/{filename}".lstrip("/")
-
-    body = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
-    _s3._put_object(bucket, key, body, {"content-type": "application/json"})
-
-    return f"s3://{bucket}/{key}"
-
-
-def _iceberg_create_table(ns, body):
-    """POST /namespaces/{ns}/tables -- create an Iceberg table."""
-    if ns not in _databases:
-        return _iceberg_error(f"Namespace does not exist: {ns}", "NoSuchNamespaceException", 404)
-
-    name = body.get("name", "")
-    if not name:
-        return _iceberg_error("Table name is required", "BadRequestException", 400)
-
-    key = f"{ns}/{name}"
-    if key in _tables and (_tables[key].get("Parameters") or {}).get("metadata_location"):
-        return _iceberg_error(f"Table already exists: {ns}.{name}", "AlreadyExistsException", 409)
-
-    # Build initial metadata from the request
-    schema = body.get("schema", {})
-    partition_spec = body.get("partition-spec", body.get("partition_spec", {}))
-    location = body.get("location", "")
-    properties = body.get("properties", {})
-
-    metadata = {
-        "format-version": body.get("format-version", 2),
-        "table-uuid": new_uuid(),
-        "location": location or f"s3://iceberg-warehouse/{ns}/{name}",
-        "last-sequence-number": 0,
-        "last-updated-ms": int(time.time() * 1000),
-        "last-column-id": max((f.get("id", 0) for f in schema.get("fields", [])), default=0),
-        "current-schema-id": schema.get("schema-id", 0),
-        "schemas": [schema] if schema else [],
-        "default-spec-id": 0,
-        "partition-specs": [partition_spec] if partition_spec else [{"spec-id": 0, "fields": []}],
-        "last-partition-id": 999,
-        "default-sort-order-id": 0,
-        "sort-orders": [{"order-id": 0, "fields": []}],
-        "properties": properties,
-        "current-snapshot-id": -1,
-        "snapshots": [],
-        "snapshot-log": [],
-        "metadata-log": [],
-    }
-
-    metadata_location = _iceberg_write_metadata(metadata)
-
-    # Register in the Glue catalog
-    _tables[key] = {
-        "Name": name,
-        "DatabaseName": ns,
-        "Description": "",
-        "Owner": "",
-        "CreateTime": int(time.time()),
-        "UpdateTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
-        "StorageDescriptor": {},
-        "PartitionKeys": [],
-        "TableType": "EXTERNAL_TABLE",
-        "Parameters": {
-            "metadata_location": metadata_location,
-            "table_type": "ICEBERG",
-        },
-        "IsRegisteredWithLakeFormation": False,
-        "CatalogId": get_account_id(),
-        "VersionId": "1",
-    }
-
-    return _iceberg_json(
-        {
-            "metadata-location": metadata_location,
-            "metadata": metadata,
-            "config": _iceberg_s3_overrides(),
-        }
-    )
-
-
-def _iceberg_commit_table(ns, table_name, body):
-    """POST /namespaces/{ns}/tables/{tbl} -- commit updates (new snapshot)."""
-    table = _iceberg_table_entry(ns, table_name)
-    if table is None:
-        return _iceberg_error(f"Table does not exist: {ns}.{table_name}", "NoSuchTableException", 404)
-
-    metadata_location = table["Parameters"]["metadata_location"]
-    metadata = _iceberg_fetch_metadata(metadata_location)
-    if metadata is None:
-        return _iceberg_error(f"Cannot read current metadata for {ns}.{table_name}", "CommitFailedException", 500)
-
-    # Apply updates from the request
-    requirements = body.get("requirements", [])
-    updates = body.get("updates", [])
-
-    for update in updates:
-        action = update.get("action", "")
-        if action == "add-schema":
-            schema = update.get("schema", {})
-            schemas = metadata.setdefault("schemas", [])
-            schema_id = max((s.get("schema-id", 0) for s in schemas), default=-1) + 1
-            schema["schema-id"] = schema_id
-            schemas.append(schema)
-        elif action == "set-current-schema":
-            metadata["current-schema-id"] = update.get("schema-id", 0)
-        elif action == "add-partition-spec":
-            spec = update.get("spec", {})
-            specs = metadata.setdefault("partition-specs", [])
-            spec_id = max((s.get("spec-id", 0) for s in specs), default=-1) + 1
-            spec["spec-id"] = spec_id
-            specs.append(spec)
-        elif action == "set-default-spec":
-            metadata["default-spec-id"] = update.get("spec-id", 0)
-        elif action == "add-sort-order":
-            order = update.get("sort-order", {})
-            orders = metadata.setdefault("sort-orders", [])
-            order_id = max((o.get("order-id", 0) for o in orders), default=-1) + 1
-            order["order-id"] = order_id
-            orders.append(order)
-        elif action == "set-default-sort-order":
-            metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
-        elif action == "add-snapshot":
-            snapshot = update.get("snapshot", {})
-            metadata.setdefault("snapshots", []).append(snapshot)
-            metadata["current-snapshot-id"] = snapshot.get("snapshot-id", metadata.get("current-snapshot-id", -1))
-            metadata.setdefault("snapshot-log", []).append(
-                {
-                    "timestamp-ms": snapshot.get("timestamp-ms", int(time.time() * 1000)),
-                    "snapshot-id": snapshot.get("snapshot-id"),
-                }
-            )
-            seq = metadata.get("last-sequence-number", 0) + 1
-            metadata["last-sequence-number"] = seq
-        elif action == "set-snapshot-ref":
-            ref_name = update.get("ref-name", "main")
-            refs = metadata.setdefault("refs", {})
-            refs[ref_name] = {
-                "snapshot-id": update.get("snapshot-id"),
-                "type": update.get("type", "branch"),
-            }
-            if ref_name == "main" and update.get("snapshot-id") is not None:
-                metadata["current-snapshot-id"] = update["snapshot-id"]
-        elif action == "set-properties":
-            metadata.setdefault("properties", {}).update(update.get("updates", {}))
-        elif action == "remove-properties":
-            props = metadata.get("properties", {})
-            for key in update.get("removals", []):
-                props.pop(key, None)
-        elif action == "set-location":
-            metadata["location"] = update.get("location", metadata.get("location", ""))
-        else:
-            logger.debug("Iceberg: ignoring unknown commit action %s", action)
-
-    metadata["last-updated-ms"] = int(time.time() * 1000)
-
-    # Write the new metadata and update the catalog pointer
-    old_location = metadata_location
-    new_location = _iceberg_write_metadata(metadata)
-    table["Parameters"]["metadata_location"] = new_location
-    table["UpdateTime"] = int(time.time())
-    version = int(table.get("VersionId", "1")) + 1
-    table["VersionId"] = str(version)
-
-    metadata.setdefault("metadata-log", []).append(
-        {
-            "timestamp-ms": metadata["last-updated-ms"],
-            "metadata-file": old_location,
-        }
-    )
-
-    return _iceberg_json(
-        {
-            "metadata-location": new_location,
-            "metadata": metadata,
-            "config": _iceberg_s3_overrides(),
-        }
-    )
-
-
-def _iceberg_drop_table(ns, table_name):
-    """DELETE /namespaces/{ns}/tables/{tbl} -- drop table."""
-    key = f"{ns}/{table_name}"
-    if key not in _tables:
-        return _iceberg_error(f"Table does not exist: {ns}.{table_name}", "NoSuchTableException", 404)
-    _tables.pop(key, None)
-    _partitions.pop(key, None)
-    return _iceberg_json({})
-
-
-def _iceberg_create_namespace(body):
-    """POST /namespaces -- create namespace."""
-    namespace = body.get("namespace", [])
-    if isinstance(namespace, list):
-        name = namespace[0] if namespace else ""
-    else:
-        name = str(namespace)
-    if not name:
-        return _iceberg_error("Namespace name is required", "BadRequestException", 400)
-    if name in _databases:
-        return _iceberg_error(f"Namespace already exists: {name}", "AlreadyExistsException", 409)
-    properties = body.get("properties", {})
-    _databases[name] = {
-        "Name": name,
-        "Description": properties.get("comment", ""),
-        "LocationUri": properties.get("location"),
-        "Parameters": properties,
-        "CreateTime": int(time.time()),
-        "CatalogId": get_account_id(),
-    }
-    return _iceberg_json({"namespace": [name], "properties": properties})
-
-
-def _iceberg_update_namespace_properties(ns, body):
-    """POST /namespaces/{ns}/properties -- update namespace properties."""
-    if ns not in _databases:
-        return _iceberg_error(f"Namespace does not exist: {ns}", "NoSuchNamespaceException", 404)
-    removals = body.get("removals", [])
-    updates = body.get("updates", {})
-    params = _databases[ns].setdefault("Parameters", {})
-    removed = []
-    for key in removals:
-        if key in params:
-            del params[key]
-            removed.append(key)
-    missing = [key for key in removals if key not in removed]
-    params.update(updates)
-    return _iceberg_json(
-        {
-            "updated": list(updates.keys()),
-            "removed": removed,
-            "missing": missing,
-        }
-    )
-
-
-def _iceberg_delete_namespace(ns):
-    """DELETE /namespaces/{ns} -- delete namespace."""
-    if ns not in _databases:
-        return _iceberg_error(f"Namespace does not exist: {ns}", "NoSuchNamespaceException", 404)
-    prefix = f"{ns}/"
-    if any(k.startswith(prefix) for k in _tables):
-        return _iceberg_error(f"Namespace {ns} is not empty", "NamespaceNotEmptyException", 409)
-    del _databases[ns]
-    return _iceberg_json({})
-
-
 def _handle_iceberg_rest(method, path, query_params, body=None):
     _iceberg_maybe_log_tls_hint()
     parts = [unquote(p) for p in path.strip("/").split("/") if p]
@@ -820,13 +549,10 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
     if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
         return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
 
-    # -- Namespace operations --
+    # -- Namespace operations (read-only) --
 
-    if len(parts) == 5:
-        if method == "GET":
-            return _iceberg_json({"namespaces": [[name] for name in sorted(_databases.keys())]})
-        if method == "POST":
-            return _iceberg_create_namespace(body)
+    if len(parts) == 5 and method == "GET":
+        return _iceberg_json({"namespaces": [[name] for name in sorted(_databases.keys())]})
 
     if len(parts) == 6:
         ns = parts[5]
@@ -836,11 +562,6 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
             return _iceberg_json({"namespace": [ns], "properties": _databases[ns].get("Parameters", {})})
         if method == "HEAD":
             return (200 if ns in _databases else 404), {}, b""
-        if method == "DELETE":
-            return _iceberg_delete_namespace(ns)
-
-    if len(parts) == 7 and parts[6] == "properties" and method == "POST":
-        return _iceberg_update_namespace_properties(parts[5], body)
 
     # -- Table operations --
 
@@ -857,8 +578,6 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
                     if k.startswith(prefix) and (t.get("Parameters") or {}).get("metadata_location")
                 )
                 return _iceberg_json({"identifiers": [{"namespace": [ns], "name": n} for n in names]})
-            if method == "POST":
-                return _iceberg_create_table(ns, body)
 
         if len(parts) == 8:
             tbl = parts[7]
@@ -867,10 +586,6 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
             if method == "HEAD":
                 exists = _iceberg_table_entry(ns, tbl) is not None
                 return (200 if exists else 404), {}, b""
-            if method == "POST":
-                return _iceberg_commit_table(ns, tbl, body)
-            if method == "DELETE":
-                return _iceberg_drop_table(ns, tbl)
 
     return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
 

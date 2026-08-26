@@ -584,17 +584,41 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
     matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        # The ``config`` block in a LoadTable response is applied by the
-        # Iceberg client to S3FileIO for data file reads/writes. Returning
-        # ``s3.endpoint=http://localhost:4566`` breaks containers that reach
-        # MiniStack via ``host.docker.internal``. Omit the endpoint here and
-        # let the client's own Spark conf (which knows its network topology)
-        # take effect. Credentials and path-style are safe defaults.
+        # Try to read the latest metadata from S3 (source of truth). Writers
+        # like DuckDB commit by writing metadata.json directly to S3 without
+        # going through the REST commit endpoint, so the in-memory metadata
+        # can be stale. Fall back to in-memory if S3 read fails.
+        metadata = table.get("_iceberg_metadata", {})
+        meta_loc = table.get("metadataLocation", "")
+        if meta_loc and meta_loc.startswith("s3://"):
+            try:
+                import ministack.services.s3 as _s3
+
+                rest = meta_loc[len("s3://") :]
+                bkt, key = rest.split("/", 1)
+                # Find the latest metadata file in the metadata directory
+                meta_dir = "/".join(key.split("/")[:-1]) + "/"
+                bucket_data = _s3._ensure_bucket(bkt)
+                if bucket_data:
+                    meta_files = sorted(
+                        k
+                        for k in bucket_data.get("objects", {})
+                        if k.startswith(meta_dir) and k.endswith(".metadata.json")
+                    )
+                    if meta_files:
+                        latest_key = meta_files[-1]
+                        raw = _s3._get_object_data(bkt, latest_key)
+                        if raw:
+                            metadata = json.loads(raw)
+                            meta_loc = f"s3://{bkt}/{latest_key}"
+            except Exception:
+                pass  # fall back to in-memory
         return json_response(
             {
-                "metadata-location": table.get("metadataLocation", ""),
-                "metadata": table.get("_iceberg_metadata", {}),
+                "metadata-location": meta_loc,
+                "metadata": metadata,
                 "config": {
+                    "s3.endpoint": _gateway_url(),
                     "s3.access-key-id": "test",
                     "s3.secret-access-key": "test",
                     "s3.path-style-access": "true",
@@ -681,6 +705,18 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
         new_loc = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v{v}.metadata.json"
         table["metadataLocation"] = new_loc
         table["modifiedAt"] = now_iso()
+        # Write the metadata.json to S3 so clients reading by location
+        # (DuckDB, Spark) see the committed state.
+        try:
+            import ministack.services.s3 as _s3
+
+            _s3._buckets.setdefault(bucket_name, {"created": now_iso(), "objects": {}, "region": get_region()})
+            meta_key = f"{namespace}/{table_name}/metadata/v{v}.metadata.json"
+            _s3._put_object(
+                bucket_name, meta_key, json.dumps(metadata).encode("utf-8"), {"content-type": "application/json"}
+            )
+        except Exception as exc:
+            logger.debug("s3tables: failed to write metadata.json for %s.%s: %s", namespace, table_name, exc)
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
