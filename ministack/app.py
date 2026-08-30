@@ -1667,6 +1667,27 @@ def _enforce_data_plane(
     return None
 
 
+def _iceberg_targets_glue_catalog(path, query_params):
+    """Decide whether an ``/iceberg`` REST request belongs to the Glue Data
+    Catalog (Glue jobs + Firehose lakehouse) or to S3 Tables.
+
+    Glue catalog paths carry a ``catalogs/`` segment (from the prefix its
+    ``/config`` hands back). The initial config call has no prefix yet, so it is
+    routed by the ``warehouse`` query value: S3 Tables uses an
+    ``arn:aws:s3tables:`` ARN or an ``s3tablescatalog`` warehouse; anything else
+    (a Glue catalog ARN) is the Glue Data Catalog. A bare config call with no
+    warehouse keeps the historical default of S3 Tables.
+    """
+    if "/catalogs/" in path:
+        return True
+    warehouse = query_params.get("warehouse", "") if query_params else ""
+    if isinstance(warehouse, list):
+        warehouse = warehouse[0] if warehouse else ""
+    if not warehouse:
+        return False
+    return "s3tablescatalog" not in warehouse and not warehouse.startswith("arn:aws:s3tables:")
+
+
 async def _handle_special_data_plane_request(
     method: str,
     path: str,
@@ -1676,11 +1697,17 @@ async def _handle_special_data_plane_request(
     request_id: str,
 ):
     """Handle special-case service entrypoints before the generic router."""
-    # Iceberg REST catalog — route /iceberg/* to s3tables service.
-    # Must not fall through to S3 (which reads "iceberg" as a bucket name).
+    # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
+    # prefix: the Glue Data Catalog (the lakehouse a Glue job and Firehose both
+    # write) and S3 Tables. Dispatch between them so a table one writer commits,
+    # the other reads. Must not fall through to S3 (which reads "iceberg" as a
+    # bucket name).
     if path.startswith("/iceberg"):
         try:
-            result = await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+            if _iceberg_targets_glue_catalog(path, query_params):
+                result = _get_module("glue")._handle_iceberg_rest(method, path, query_params, body=body)
+            else:
+                result = await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
             if result is not None:
                 return result
             return 200, {"Content-Type": "application/json"}, b"{}"

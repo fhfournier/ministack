@@ -2297,12 +2297,92 @@ def test_head_returns_404_for_non_iceberg_table():
 # ── Fall-throughs ────────────────────────────────────────────
 
 
-def test_post_to_table_returns_501_unsupported():
-    """Read-only surface: writes get an explicit 501 envelope instead of a
-    silent success that never persisted anything."""
+def test_commit_to_missing_table_returns_no_such_table():
+    """The Glue Data Catalog Iceberg REST catalog is writable (Firehose and
+    Glue jobs commit through it), so a POST is a real commit rather than a
+    blanket 501. A commit against a table that does not exist returns
+    NoSuchTableException, not a silent success."""
     status, _, payload = _call("POST", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/t")
-    assert status == 501
-    assert payload["error"]["type"] == "UnsupportedOperationException"
+    assert status == 404
+    assert payload["error"]["type"] == "NoSuchTableException"
+
+
+def _call_body(method, path, body=None):
+    raw = json.dumps(body).encode() if body is not None else b""
+    status, _headers, resp = asyncio.run(_svc("glue").handle_request(method, path, {}, raw, {}))
+    return status, (json.loads(resp) if resp else None)
+
+
+_GLUE_ICEBERG_CATALOG = "arn:aws:glue:us-east-1:000000000000:catalog"
+_GLUE_ICEBERG_PREFIX = f"catalogs/{_GLUE_ICEBERG_CATALOG}"
+
+
+def test_iceberg_rest_create_commit_load_shares_glue_catalog():
+    """A table created and committed through the Glue Data Catalog Iceberg REST
+    catalog (Firehose's write path) is a real Glue table the Glue API — and thus
+    a Spark job's GlueCatalog — sees. This shared store is what lets Firehose
+    and Glue jobs converge on one table."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    status, _ = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables",
+        {"name": "orders", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]}},
+    )
+    assert status == 200
+    # Same store as the Glue API: it is a real Glue Iceberg table.
+    table = _svc("glue")._tables["lake/orders"]
+    assert table["Parameters"]["table_type"] == "ICEBERG"
+    assert table["TableType"] == "EXTERNAL_TABLE"
+    # Commit a snapshot (what DuckDB does after writing data files).
+    status, doc = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders",
+        {"updates": [
+            {"action": "add-snapshot", "snapshot": {"snapshot-id": 42, "sequence-number": 1,
+                "timestamp-ms": 1, "manifest-list": "s3://x/m.avro", "summary": {"operation": "append"}}},
+            {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 42}]},
+    )
+    assert status == 200
+    assert doc["metadata"]["current-snapshot-id"] == 42
+    # loadTable reflects the committed snapshot.
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata"]["current-snapshot-id"] == 42
+
+
+def test_iceberg_rest_loads_table_written_with_s3a_scheme():
+    """Spark's S3FileIO records the metadata location with the ``s3a://`` scheme
+    (a Glue job writing via GlueCatalog). The REST catalog must read that — the
+    same MiniStack object as ``s3://`` — so a Glue-job-written table is loadable
+    by Firehose's DuckDB. Regression for the last convergence gap."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    from ministack.services import s3tables as _s3t
+
+    meta = _s3t._initial_iceberg_metadata(
+        "orders", [{"name": "id", "type": "int"}], "s3a://ministack-glue-warehouse/lake.db/orders")
+    key = "lake.db/orders/metadata/00000-x.metadata.json"
+    _svc("s3")._buckets["ministack-glue-warehouse"] = {"objects": {key: {"body": json.dumps(meta).encode()}}}
+    _svc("glue")._tables["lake/orders"] = {
+        "Name": "orders", "DatabaseName": "lake", "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"table_type": "ICEBERG",
+            "metadata_location": f"s3a://ministack-glue-warehouse/{key}"}}
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata-location"].startswith("s3a://")
+    assert doc["metadata"]["schemas"]
+
+
+def test_iceberg_dispatch_routes_glue_vs_s3tables():
+    """The app-level dispatch keeps Firehose and Glue on the Glue Data Catalog
+    while S3 Tables clients keep their own catalog."""
+    from ministack.app import _iceberg_targets_glue_catalog as targets_glue
+
+    assert targets_glue("/iceberg/v1/catalogs/x/namespaces/db/tables", {}) is True
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "arn:aws:glue:us-east-1:000000000000:catalog"}) is True
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "arn:aws:s3tables:us-east-1:000000000000:bucket/b"}) is False
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "000000000000:s3tablescatalog/b"}) is False
+    assert targets_glue("/iceberg/v1/config", {}) is False
 
 
 def test_non_catalogs_prefix_returns_501():

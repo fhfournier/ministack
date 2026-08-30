@@ -630,6 +630,68 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
+def _apply_iceberg_updates(metadata, updates):
+    """Apply a list of Iceberg REST commit ``updates`` to a table ``metadata``
+    dict in place. Shared by the S3 Tables and Glue Data Catalog Iceberg REST
+    catalogs so both apply commits (from DuckDB, Spark, ...) identically."""
+    for update in updates:
+        action = update.get("action", "")
+        if action == "add-snapshot":
+            snapshot = update.get("snapshot", {})
+            metadata.setdefault("snapshots", []).append(snapshot)
+            metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
+            metadata["last-updated-ms"] = int(time.time() * 1000)
+            metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
+        elif action == "set-snapshot-ref":
+            metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
+                "snapshot-id": update.get("snapshot-id", -1),
+                "type": update.get("type", "branch"),
+            }
+        elif action == "add-schema":
+            new_schema = update.get("schema", {})
+            existing = metadata.setdefault("schemas", [])
+            # Idempotent by schema-id: a client re-declaring its current,
+            # unchanged schema on every write (Spark does this) must not pile
+            # up a second entry with the same id -- Iceberg's schemasById()
+            # crashes on load with "Multiple entries with same key" if it does.
+            if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
+                existing.append(new_schema)
+            # Advance last-column-id to the highest field ID in the new
+            # schema, so a client allocating the next column's ID (e.g.
+            # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
+            field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
+            if field_ids:
+                metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
+        elif action == "set-current-schema":
+            metadata["current-schema-id"] = update.get("schema-id", 0)
+        elif action in ("add-spec", "add-partition-spec"):
+            # "add-spec" is the Iceberg REST spec's action name (what
+            # duckdb-iceberg sends); "add-partition-spec" is a non-standard
+            # alias some hand-rolled callers use. Accept both.
+            new_spec = update.get("spec", {})
+            specs = metadata.setdefault("partition-specs", [])
+            # Idempotent by spec-id, for the same reason as add-schema above.
+            if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
+                specs.append(new_spec)
+        elif action == "set-default-spec":
+            metadata["default-spec-id"] = update.get("spec-id", 0)
+        elif action == "add-sort-order":
+            new_order = update.get("sort-order", {})
+            orders = metadata.setdefault("sort-orders", [])
+            # Idempotent by order-id, for the same reason as add-schema above.
+            if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
+                orders.append(new_order)
+        elif action == "set-default-sort-order":
+            metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
+        elif action == "set-properties":
+            metadata.setdefault("properties", {}).update(update.get("updates", {}))
+        elif action == "remove-properties":
+            for r in update.get("removals", []):
+                metadata.get("properties", {}).pop(r, None)
+        elif action == "set-location":
+            metadata["location"] = update.get("location", "")
+
+
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter=None):
     def _pred(table):
         if _namespace_name(table) != namespace or table["name"] != table_name:
@@ -642,62 +704,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
     if matches:
         table = matches[0]
         metadata = table.get("_iceberg_metadata", {})
-        for update in data.get("updates", []):
-            action = update.get("action", "")
-            if action == "add-snapshot":
-                snapshot = update.get("snapshot", {})
-                metadata.setdefault("snapshots", []).append(snapshot)
-                metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
-                metadata["last-updated-ms"] = int(time.time() * 1000)
-                metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
-            elif action == "set-snapshot-ref":
-                metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
-                    "snapshot-id": update.get("snapshot-id", -1),
-                    "type": update.get("type", "branch"),
-                }
-            elif action == "add-schema":
-                new_schema = update.get("schema", {})
-                existing = metadata.setdefault("schemas", [])
-                # Idempotent by schema-id: a client re-declaring its current,
-                # unchanged schema on every write (Spark does this) must not pile
-                # up a second entry with the same id -- Iceberg's schemasById()
-                # crashes on load with "Multiple entries with same key" if it does.
-                if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
-                    existing.append(new_schema)
-                # Advance last-column-id to the highest field ID in the new
-                # schema, so a client allocating the next column's ID (e.g.
-                # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
-                field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
-                if field_ids:
-                    metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
-            elif action == "set-current-schema":
-                metadata["current-schema-id"] = update.get("schema-id", 0)
-            elif action in ("add-spec", "add-partition-spec"):
-                # "add-spec" is the Iceberg REST spec's action name (what
-                # duckdb-iceberg sends); "add-partition-spec" is a non-standard
-                # alias some hand-rolled callers use. Accept both.
-                new_spec = update.get("spec", {})
-                specs = metadata.setdefault("partition-specs", [])
-                # Idempotent by spec-id, for the same reason as add-schema above.
-                if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
-                    specs.append(new_spec)
-            elif action == "set-default-spec":
-                metadata["default-spec-id"] = update.get("spec-id", 0)
-            elif action == "add-sort-order":
-                new_order = update.get("sort-order", {})
-                orders = metadata.setdefault("sort-orders", [])
-                # Idempotent by order-id, for the same reason as add-schema above.
-                if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
-                    orders.append(new_order)
-            elif action == "set-default-sort-order":
-                metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
-            elif action == "set-properties":
-                metadata.setdefault("properties", {}).update(update.get("updates", {}))
-            elif action == "remove-properties":
-                for r in update.get("removals", []):
-                    metadata.get("properties", {}).pop(r, None)
-            elif action == "set-location":
-                metadata["location"] = update.get("location", "")
+        _apply_iceberg_updates(metadata, data.get("updates", []))
 
         table["_metadata_version"] = table.get("_metadata_version", 0) + 1
         v = table["_metadata_version"]
@@ -795,8 +802,12 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
         return _iceberg_config(query_params)
 
-    # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit
-    if parts[1] == "v1" and parts[2] == "transactions" and method == "POST":
+    # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit.
+    # DuckDB prepends the /v1/config prefix (the warehouse) to every path, so
+    # this arrives as /iceberg/v1/{prefix}/transactions/commit. Match on the
+    # `transactions` segment wherever it lands, not a fixed position — otherwise
+    # a prefixed commit is silently dropped and the delivery writes nothing.
+    if parts[1] == "v1" and method == "POST" and "transactions" in parts[2:]:
         data = json.loads(body) if body else {}
         for change in data.get("table-changes", []):
             ident = change.get("identifier", {})

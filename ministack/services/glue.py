@@ -451,9 +451,12 @@ def _iceberg_fetch_metadata(metadata_location):
     """Read the metadata.json at an ``s3://bucket/key`` URI from MiniStack's
     S3 and return it parsed, or None if the URI is malformed, the object is
     missing, or the body isn't valid JSON."""
-    if not metadata_location or not metadata_location.startswith("s3://"):
+    # Spark's S3FileIO writes `s3a://` locations; DuckDB and our REST catalog
+    # write `s3://`. Both point at the same MiniStack S3 object, so accept either.
+    scheme = next((s for s in ("s3://", "s3a://") if metadata_location and metadata_location.startswith(s)), None)
+    if scheme is None:
         return None
-    rest = metadata_location[len("s3://") :]
+    rest = metadata_location[len(scheme) :]
     if "/" not in rest:
         return None
     bucket, key = rest.split("/", 1)
@@ -482,11 +485,40 @@ def _iceberg_table_entry(db_name, table_name):
     return table
 
 
+def _iceberg_latest_metadata_location(metadata_location):
+    """A writer (DuckDB, Spark) commits by writing the next ``vN.metadata.json``
+    to S3, and does not always drive it through the REST commit endpoint, so the
+    table's stored pointer can lag. Scan the metadata directory for the newest
+    ``.metadata.json`` and return it, falling back to the stored pointer."""
+    scheme = next((s for s in ("s3://", "s3a://") if metadata_location and metadata_location.startswith(s)), None)
+    if scheme is None:
+        return metadata_location
+    try:
+        from ministack.services import s3 as _s3
+
+        rest = metadata_location[len(scheme) :]
+        bucket, key = rest.split("/", 1)
+        meta_dir = "/".join(key.split("/")[:-1]) + "/"
+        bucket_data = _s3._ensure_bucket(bucket)
+        if not bucket_data:
+            return metadata_location
+        meta_files = sorted(
+            k for k in bucket_data.get("objects", {}) if k.startswith(meta_dir) and k.endswith(".metadata.json")
+        )
+        if meta_files:
+            # Order by version number, not lexically: v10 must sort after v2.
+            meta_files.sort(key=lambda k: _metadata_version_from_location(k))
+            return f"{scheme}{bucket}/{meta_files[-1]}"
+    except Exception:
+        pass
+    return metadata_location
+
+
 def _iceberg_load_table(db_name, table_name):
     table = _iceberg_table_entry(db_name, table_name)
     if table is None:
         return _iceberg_error(f"Table does not exist: {db_name}.{table_name}", "NoSuchTableException", 404)
-    metadata_location = table["Parameters"]["metadata_location"]
+    metadata_location = _iceberg_latest_metadata_location(table["Parameters"]["metadata_location"])
     # Missing/unparseable metadata.json is a 404, not a 200 with empty
     # metadata — DuckDB would treat the latter as a real-but-empty table
     # and silently return wrong query results.
@@ -522,6 +554,149 @@ def _iceberg_maybe_log_tls_hint():
         )
 
 
+# The default warehouse for Glue Data Catalog Iceberg tables. Spark's
+# GlueCatalog writes here (see the injected `warehouse=s3a://...` conf), and
+# the REST catalog writes here too so a table Firehose commits and a table a
+# Glue job commits land in the same place.
+_GLUE_WAREHOUSE_BUCKET = "ministack-glue-warehouse"
+
+
+def _metadata_version_from_location(metadata_location):
+    """Extract the integer N from a ``.../vN.metadata.json`` location, or -1 if
+    it doesn't match, so a commit can allocate the next version."""
+    if not metadata_location:
+        return -1
+    tail = metadata_location.rsplit("/", 1)[-1]
+    if tail.startswith("v") and tail.endswith(".metadata.json"):
+        try:
+            return int(tail[1:-len(".metadata.json")])
+        except ValueError:
+            return -1
+    return -1
+
+
+def _iceberg_write_metadata(namespace, table_name, version, metadata):
+    """Write ``metadata`` as ``vN.metadata.json`` under the Glue warehouse and
+    return its ``s3://`` location. Clients (DuckDB, Spark) read by location."""
+    from ministack.services import s3 as _s3
+
+    if _s3._ensure_bucket(_GLUE_WAREHOUSE_BUCKET) is None:
+        _s3._create_bucket(_GLUE_WAREHOUSE_BUCKET, b"", {})
+    key = f"{namespace}/{table_name}/metadata/v{version}.metadata.json"
+    _s3._put_object(
+        _GLUE_WAREHOUSE_BUCKET, key, json.dumps(metadata).encode("utf-8"),
+        {"content-type": "application/json"},
+    )
+    return f"s3://{_GLUE_WAREHOUSE_BUCKET}/{key}"
+
+
+def _iceberg_rest_create_namespace(body):
+    """POST namespaces -- create a Glue database to back an Iceberg namespace."""
+    ns_field = body.get("namespace", [])
+    ns = ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")
+    if not ns:
+        return _iceberg_error("Missing namespace", "BadRequestException", 400)
+    if ns not in _databases:
+        _databases[ns] = {
+            "Name": ns,
+            "Description": "",
+            "LocationUri": None,
+            "Parameters": body.get("properties", {}) or {},
+            "CreateTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        }
+    return _iceberg_json({"namespace": [ns], "properties": _databases[ns].get("Parameters", {})})
+
+
+def _iceberg_rest_create_table(namespace, body):
+    """POST namespaces/{ns}/tables -- register a Glue Iceberg table and write
+    its initial metadata.json to the warehouse."""
+    from ministack.services import s3tables as _s3t
+
+    if namespace not in _databases:
+        return _iceberg_error(f"Namespace does not exist: {namespace}", "NoSuchNamespaceException", 404)
+    table_name = body.get("name", "")
+    key = f"{namespace}/{table_name}"
+    # createTable is not idempotent -- a resent create must not wipe snapshots.
+    if key in _tables:
+        return _iceberg_error(f"Table already exists: {namespace}.{table_name}", "AlreadyExistsException", 409)
+
+    schema = body.get("schema", {})
+    schema_fields = [
+        {
+            "name": f.get("name", ""),
+            "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
+            "required": f.get("required", False),
+        }
+        for f in schema.get("fields", [])
+    ]
+    location = body.get("location") or f"s3://{_GLUE_WAREHOUSE_BUCKET}/{namespace}/{table_name}"
+    metadata = _s3t._initial_iceberg_metadata(table_name, schema_fields, location)
+    if schema:
+        metadata["schemas"] = [schema]
+    partition_spec = body.get("partition-spec")
+    if partition_spec:
+        metadata["partition-specs"] = [partition_spec]
+        metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
+    metadata_location = _iceberg_write_metadata(namespace, table_name, 0, metadata)
+
+    _tables[key] = {
+        "Name": table_name,
+        "DatabaseName": namespace,
+        "Description": "",
+        "Owner": "",
+        "CreateTime": int(time.time()),
+        "UpdateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
+        "StorageDescriptor": {
+            "Location": location,
+            "Columns": [{"Name": f["name"], "Type": f["type"]} for f in schema_fields],
+        },
+        "PartitionKeys": [],
+        "TableType": "EXTERNAL_TABLE",
+        # `table_type=ICEBERG` is how Iceberg's GlueCatalog recognises the table,
+        # and `metadata_location` is the pointer both it and this REST catalog
+        # follow. Writing them here means a Firehose-created table is a normal
+        # Glue table that a Spark job's GlueCatalog can load.
+        "Parameters": {"table_type": "ICEBERG", "metadata_location": metadata_location},
+        "CatalogId": get_account_id(),
+        "VersionId": "1",
+    }
+    return _iceberg_json({"metadata-location": metadata_location, "metadata": metadata})
+
+
+def _iceberg_rest_commit_table(namespace, table_name, body):
+    """POST namespaces/{ns}/tables/{tbl} -- apply an Iceberg commit against a
+    Glue table: read current metadata, apply the updates, write the next
+    metadata.json, and advance the table's metadata_location."""
+    from ministack.services import s3tables as _s3t
+
+    table = _iceberg_table_entry(namespace, table_name)
+    if table is None:
+        return _iceberg_error(f"Table does not exist: {namespace}.{table_name}", "NoSuchTableException", 404)
+    meta_loc = table["Parameters"]["metadata_location"]
+    metadata = _iceberg_fetch_metadata(meta_loc) or {}
+    _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    version = _metadata_version_from_location(meta_loc) + 1
+    new_loc = _iceberg_write_metadata(namespace, table_name, version, metadata)
+    table["Parameters"]["metadata_location"] = new_loc
+    table["UpdateTime"] = int(time.time())
+    return _iceberg_json({"metadata-location": new_loc, "metadata": metadata})
+
+
+def _iceberg_rest_commit_transaction(body):
+    """POST transactions/commit -- DuckDB's atomic multi-table commit."""
+    for change in body.get("table-changes", []):
+        ident = change.get("identifier", {})
+        ns_field = ident.get("namespace", [""])
+        ns = ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")
+        tbl = ident.get("name", "")
+        result = _iceberg_rest_commit_table(ns, tbl, change)
+        if result and result[0] not in (200, 204):
+            return result
+    return _iceberg_json({})
+
+
 def _handle_iceberg_rest(method, path, query_params, body=None):
     _iceberg_maybe_log_tls_hint()
     parts = [unquote(p) for p in path.strip("/").split("/") if p]
@@ -546,13 +721,23 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
         return _iceberg_json({"defaults": defaults, "overrides": _iceberg_s3_overrides()})
 
     # /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
-    if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
+    if len(parts) < 5 or parts[2] != "catalogs":
         return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
 
-    # -- Namespace operations (read-only) --
+    # POST /v1/catalogs/{catalog}/transactions/commit -- DuckDB's atomic commit
+    if parts[4] == "transactions" and method == "POST":
+        return _iceberg_rest_commit_transaction(body)
+
+    if parts[4] != "namespaces":
+        return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
+
+    # -- Namespace operations --
 
     if len(parts) == 5 and method == "GET":
         return _iceberg_json({"namespaces": [[name] for name in sorted(_databases.keys())]})
+
+    if len(parts) == 5 and method == "POST":
+        return _iceberg_rest_create_namespace(body)
 
     if len(parts) == 6:
         ns = parts[5]
@@ -578,11 +763,15 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
                     if k.startswith(prefix) and (t.get("Parameters") or {}).get("metadata_location")
                 )
                 return _iceberg_json({"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+            if method == "POST":
+                return _iceberg_rest_create_table(ns, body)
 
         if len(parts) == 8:
             tbl = parts[7]
             if method == "GET":
                 return _iceberg_load_table(ns, tbl)
+            if method == "POST":
+                return _iceberg_rest_commit_table(ns, tbl, body)
             if method == "HEAD":
                 exists = _iceberg_table_entry(ns, tbl) is not None
                 return (200 if exists else 404), {}, b""
@@ -1679,7 +1868,13 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
                 "--conf",
                 f"spark.sql.catalog.spark_catalog.glue.endpoint={s3_endpoint}",
                 "--conf",
-                "spark.sql.catalog.spark_catalog.warehouse=s3a://ministack-glue-warehouse/",
+                # `s3://`, not `s3a://`: Iceberg's S3FileIO (io-impl above) and
+                # DuckDB both address objects with the `s3://` scheme via the AWS
+                # SDK. An `s3a://` warehouse stamps `s3a://` into table metadata,
+                # which DuckDB's httpfs cannot write to — so a Firehose commit to
+                # a Spark-created table silently no-ops. Keeping both engines on
+                # `s3://` is what lets them share one table.
+                "spark.sql.catalog.spark_catalog.warehouse=s3://ministack-glue-warehouse/",
                 "--conf",
                 "spark.sql.catalog.spark_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
                 "--conf",
