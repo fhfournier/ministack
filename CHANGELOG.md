@@ -5,7 +5,7 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [1.6.0] — 2026-08-31
+## [1.5.4] — 2026-08-31
 
 ### Added
 - **AppSync — `APPSYNC_JS` resolvers execute** — resolver code was stored and never run; `request()` now decides what the data source is asked for and `response()` shapes the answer, with `util.error`, `util.appendError` and `runtime.earlyReturn` following AWS in both of its documented positions, pipeline resolvers threading `ctx.stash`, and `extensions.evictFromApiCache` recorded back to the service. `NONE`, `HTTP`, `AMAZON_DYNAMODB` and `AWS_LAMBDA` data sources execute; the remaining types refuse with `NotImplemented`. Evaluation runs on a pool of Node workers — one evaluation in flight per worker, a 30-second bound with kill-and-respawn, a heap cap, and resolver console output surfaced in the service log. Contributed by @jbschooley.
